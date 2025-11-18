@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env
+.env.*
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Python library folders and caches
+*.egg-info/
+*.eggs/
+build/
+dist/
+
+# Stores and databases
+faiss_store/
+chroma_store/
+graphrag_index/
+traditional_index.faiss
+
+# Jupyter and notebook checkpoints
+.ipynb_checkpoints/
+
+# Other files
+*.bak
+*.swp
