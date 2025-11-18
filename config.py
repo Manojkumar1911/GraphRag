@@ -25,8 +25,8 @@ class GraphRAGConfig:
     neo4j_password: str | None = os.getenv("NEO4J_PASSWORD")
     neo4j_database: str | None = os.getenv("NEO4J_DATABASE", "neo4j")
 
-    gemini_api_key: str | None = os.getenv("GEMINI_API_KEY")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    groq_api_key: str | None = os.getenv("GROQ_API_KEY")
+    groq_model: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     chunk_similarity_threshold: float = float(os.getenv("CHUNK_SIMILARITY_THRESHOLD", "0.8"))
     entity_merge_similarity_threshold: float = float(os.getenv("ENTITY_MERGE_SIMILARITY_THRESHOLD", "0.85"))
@@ -50,8 +50,8 @@ class GraphRAGConfig:
             missing.append("NEO4J_USERNAME is required")
         if not self.neo4j_password:
             missing.append("NEO4J_PASSWORD is required")
-        if not self.gemini_api_key:
-            missing.append("GEMINI_API_KEY is required")
+        if not self.groq_api_key:
+            missing.append("GROQ_API_KEY is required")
 
         if missing:
             raise ValueError("\n".join(missing))

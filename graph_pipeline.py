@@ -5,12 +5,23 @@ import pickle
 import time
 from threading import Lock
 from typing import Callable, TypeVar
+from collections import Counter
+from pathlib import Path
+from functools import lru_cache
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
 from neo4j import GraphDatabase, Session, Driver
 from neo4j.exceptions import ServiceUnavailable, SessionExpired
 from sentence_transformers import SentenceTransformer
 import chromadb
-import google.generativeai as genai
+from groq import Groq
 import spacy
+import networkx as nx
 
 try:
     from pyvis.network import Network
@@ -24,14 +35,21 @@ NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "mixtral-8x7b-32768")
+GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "3"))
+GROQ_BASE_BACKOFF_SECONDS = float(os.getenv("GROQ_BASE_BACKOFF_SECONDS", "2"))
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_store")
 SPACY_MODEL = os.getenv("SPACY_MODEL", "en_core_web_sm")
-GEMINI_MIN_INTERVAL_SECONDS = float(os.getenv("GEMINI_MIN_INTERVAL_SECONDS", "4.5"))
-GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
-GEMINI_BASE_BACKOFF_SECONDS = float(os.getenv("GEMINI_BASE_BACKOFF_SECONDS", "5"))
 INDEX_DIR = os.getenv("INDEX_DIR", "./graphrag_index")
 INDEX_FILE = os.path.join(INDEX_DIR, "index.json")
+GRAPH_PROJECTION_NAME = os.getenv("GRAPH_PROJECTION_NAME", "entityGraph")
+COMMUNITY_PROPERTY = os.getenv("COMMUNITY_PROPERTY", "communityId")
+WCC_PROPERTY = os.getenv("WCC_PROPERTY", "wccId")
+PAGERANK_PROPERTY = os.getenv("PAGERANK_PROPERTY", "pagerank")
+COMMUNITY_SEED_LIMIT = int(os.getenv("COMMUNITY_SEED_LIMIT", "5"))
+SUMMARY_TOP_N = int(os.getenv("SUMMARY_TOP_N", "50"))
+SUPPORTING_TEXT_LIMIT = int(os.getenv("SUPPORTING_TEXT_LIMIT", "5"))
 
 try:
     nlp = spacy.load(SPACY_MODEL)
@@ -41,67 +59,58 @@ except OSError as exc:
     ) from exc
 
 # ---------------------------------------------
-# INITIALIZE Gemini-2.0-Flash
-# ---------------------------------------------
-genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-
-_llm_call_lock = Lock()
-_last_llm_call_ts = 0.0
-
-
-def _respect_rate_limit() -> None:
-    global _last_llm_call_ts
-    with _llm_call_lock:
-        elapsed = time.time() - _last_llm_call_ts
-        wait_seconds = GEMINI_MIN_INTERVAL_SECONDS - elapsed
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
-
-
-def _register_call_timestamp() -> None:
-    global _last_llm_call_ts
-    with _llm_call_lock:
-        _last_llm_call_ts = time.time()
-
-
-def _extract_retry_after_seconds(message: str) -> float | None:
-    match = re.search(r"retry in ([0-9.]+)s", message)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return None
-    return None
+if GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+else:
+    groq_client = None
 
 
 def llm_call(prompt: str) -> str:
-    """Call Gemini LLM and return text"""
-    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
-        _respect_rate_limit()
+    """Call Groq LLM and return text"""
+    if groq_client is None:
+        raise RuntimeError("GROQ_API_KEY is not set. Please configure your Groq credentials.")
+
+    for attempt in range(1, GROQ_MAX_RETRIES + 1):
         try:
-            response = gemini_model.generate_content(prompt)
-            _register_call_timestamp()
-            return response.text or ""
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            choice = response.choices[0].message.content if response.choices else ""
+            return choice or ""
         except Exception as e:
             err_msg = str(e)
-            print(f"LLM call error (attempt {attempt}/{GEMINI_MAX_RETRIES}): {err_msg}")
-
-            retry_after = _extract_retry_after_seconds(err_msg)
-            if retry_after is None:
-                retry_after = GEMINI_BASE_BACKOFF_SECONDS * attempt
-
-            if attempt == GEMINI_MAX_RETRIES:
-                return ""
-
-            time.sleep(retry_after)
+            print(f"LLM call error (attempt {attempt}/{GROQ_MAX_RETRIES}): {err_msg}")
+            if attempt == GROQ_MAX_RETRIES:
+                break
+            backoff = GROQ_BASE_BACKOFF_SECONDS * attempt
+            time.sleep(backoff)
 
     return ""
+
+
+@lru_cache(maxsize=4)
+def _load_prompt_template(filename: str) -> str:
+    template_path = Path(__file__).resolve().parent / filename
+    if not template_path.exists():
+        raise FileNotFoundError(f"Prompt template not found: {template_path}")
+    return template_path.read_text(encoding="utf-8").strip()
 
 # ---------------------------------------------
 # INITIALIZE Embeddings
 # ---------------------------------------------
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+def get_embedding(text):
+    """Generate an embedding for the given text using the sentence transformer."""
+    if not text or not isinstance(text, str):
+        return None
+    try:
+        # Generate embedding and convert to list for serialization
+        return embedder.encode(text, convert_to_tensor=False)
+    except Exception as e:
+        print(f"Error generating embedding: {e}")
+        return None
 
 # ---------------------------------------------
 # INITIALIZE Vector DB (Chroma)
@@ -120,6 +129,15 @@ def _get_neo4j_driver():
     global _neo4j_driver
     with _neo4j_lock:
         if _neo4j_driver is None:
+            if not NEO4J_URI:
+                raise RuntimeError(
+                    "NEO4J_URI is not set. Please specify a Bolt or Neo4j URI in your environment, "
+                    "e.g. bolt://localhost:7687"
+                )
+            if not NEO4J_USERNAME or not NEO4J_PASSWORD:
+                raise RuntimeError(
+                    "NEO4J_USERNAME and NEO4J_PASSWORD must be set in the environment before running the pipeline."
+                )
             _neo4j_driver = GraphDatabase.driver(
                 NEO4J_URI,
                 auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
@@ -160,6 +178,30 @@ def _with_session(func: Callable[[Session], T], *, max_attempts: int = 3) -> T:
         raise last_error
     raise RuntimeError("Neo4j operation failed without specific error")
 
+
+def attach_supporting_texts(communities, chunks):
+    """Populate each community with supporting text snippets from the KB."""
+    if not communities or not chunks:
+        return
+
+    chunk_cache = [(chunk, chunk.lower()) for chunk in chunks]
+
+    for community in communities:
+        members = community.get("members", []) if isinstance(community, dict) else []
+        keywords = {name.lower() for name in members if isinstance(name, str)}
+        if not keywords:
+            community["supporting_texts"] = []
+            continue
+
+        scored = []
+        for chunk, lowered in chunk_cache:
+            count = sum(1 for kw in keywords if kw in lowered)
+            if count > 0:
+                scored.append((count, chunk.strip()))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        community["supporting_texts"] = [text for _, text in scored[:SUPPORTING_TEXT_LIMIT]]
+
 def clear_graph():
     """Clear all nodes and relationships from Neo4j"""
     def _clear(session: Session):
@@ -192,15 +234,14 @@ def _dedupe_spans(spans):
     unique = []
     seen = set()
     for span in spans:
-        key = (span.start, span.end)
+        key = (span.start, span.end, span.text.lower())
         if key not in seen:
             unique.append(span)
             seen.add(key)
     return unique
 
-
 def extract_entities_relations(chunk):
-    """Extract entities and relationships using spaCy"""
+    """Extract entities and relationships using spaCy with co-occurrence fallback"""
     try:
         doc = nlp(chunk)
     except Exception as e:
@@ -210,22 +251,30 @@ def extract_entities_relations(chunk):
     token_ent_map = {}
     entities = []
     seen_entities = set()
+    sentence_entities = {}  # Track entities by sentence
 
-    for ent in doc.ents:
-        name = ent.text.strip()
-        if not name:
-            continue
-        key = name.lower()
-        if key not in seen_entities:
-            entities.append({"name": name, "type": ent.label_})
-            seen_entities.add(key)
-        for token in ent:
-            token_ent_map[token.i] = ent
+    # First pass: extract all entities
+    for sent in doc.sents:
+        sent_ents = []
+        for ent in sent.ents:
+            name = ent.text.strip()
+            if not name:
+                continue
+            key = name.lower()
+            if key not in seen_entities:
+                entities.append({"name": name, "type": ent.label_})
+                seen_entities.add(key)
+            sent_ents.append(ent)
+            for token in ent:
+                token_ent_map[token.i] = ent
+        sentence_entities[sent] = sent_ents
 
     relationships = []
-    rel_seen = set()
+    rel_seen = set()  # (source, target, type) tuples
 
-    for sent in doc.sents:
+    # Second pass: extract relationships
+    for sent, sent_ents in sentence_entities.items():
+        # 1. First try verb-based extraction
         for token in sent:
             if token.pos_ not in {"VERB", "AUX"}:
                 continue
@@ -290,6 +339,26 @@ def extract_entities_relations(chunk):
                         "type": rel_type
                     })
 
+        # 2. Add co-occurrence relationships for all entity pairs in the sentence
+        if len(sent_ents) > 1:
+            for i, ent1 in enumerate(sent_ents):
+                for ent2 in sent_ents[i+1:]:
+                    source = ent1.text.strip()
+                    target = ent2.text.strip()
+                    if not source or not target or source == target:
+                        continue
+                    # Ensure consistent ordering for deduplication
+                    if source.lower() > target.lower():
+                        source, target = target, source
+                    key = (source.lower(), target.lower(), "co_occurs_with")
+                    if key not in rel_seen:
+                        rel_seen.add(key)
+                        relationships.append({
+                            "source": source,
+                            "target": target,
+                            "type": "co_occurs_with"
+                        })
+
     return {"entities": entities, "relationships": relationships}
 
 # ---------------------------------------------
@@ -302,7 +371,11 @@ def build_graph_in_neo4j(chunk_items):
             for ent in item["entities"]:
                 if ent.get("name") and ent.get("type"):
                     session.run(
-                        "MERGE (n:Entity {name:$name}) SET n.type = $type",
+                        """
+                        MERGE (n:Entity {name:$name})
+                        SET n.id = COALESCE(n.id, $name),
+                            n.type = $type
+                        """,
                         name=ent["name"].strip(),
                         type=ent["type"].strip()
                     )
@@ -324,47 +397,157 @@ def build_graph_in_neo4j(chunk_items):
     _with_session(_build)
 
 # ---------------------------------------------
-# STEP 5: Community Detection (Louvain Algorithm)
+# STEP 5: Community Detection (NetworkX Louvain)
 # ---------------------------------------------
 def detect_communities():
-    """Detect communities using simple connected components"""
-    def _detect(session: Session):
-        try:
-            result = session.run("""
-                MATCH (n:Entity)
-                OPTIONAL MATCH path = (n)-[*]-(m:Entity)
-                WITH n, COLLECT(DISTINCT m) AS connected
-                RETURN n.name AS name,
-                       CASE WHEN SIZE(connected) > 0
-                            THEN connected[0].name
-                            ELSE n.name
-                       END AS community
-            """)
+    """Detect communities using NetworkX Louvain clustering."""
+    print("Running NetworkX Louvain community detection...")
 
-            communities = {}
-            for record in result:
-                comm_id = record["community"]
-                communities.setdefault(comm_id, []).append(record["name"])
+    def _fetch_graph(session: Session):
+        node_query = """
+        MATCH (n:Entity)
+        RETURN elementId(n) AS element_id, n.name AS name, n.type AS type
+        """
+        edge_query = """
+        MATCH (a:Entity)-[:RELATION]->(b:Entity)
+        RETURN elementId(a) AS source, elementId(b) AS target
+        """
 
-            return list(communities.values())
-        except Exception as e:
-            print(f"Community detection error: {e}")
-            result = session.run("MATCH (n:Entity) RETURN n.name AS name")
-            return [[record["name"] for record in result]]
+        node_records = session.run(node_query).data()
+        edge_records = session.run(edge_query).data()
+        return node_records, edge_records
 
-    return _with_session(_detect)
+    node_records, edge_records = _with_session(_fetch_graph)
+
+    if not node_records:
+        return {"communities": [], "metrics": {"louvain": {"communityCount": 0}}}
+
+    graph = nx.Graph()
+    for record in node_records:
+        node_id = record["element_id"]
+        graph.add_node(
+            node_id,
+            name=record.get("name"),
+            type=record.get("type"),
+        )
+
+    for record in edge_records:
+        source = record.get("source")
+        target = record.get("target")
+        if source is None or target is None:
+            continue
+        graph.add_edge(source, target)
+
+    if graph.number_of_nodes() == 0:
+        return {"communities": [], "metrics": {"louvain": {"communityCount": 0}}}
+
+    if graph.number_of_edges() == 0:
+        communities_sets = [{node} for node in graph.nodes]
+        pagerank_scores = {node: 1.0 for node in graph.nodes}
+        modularity_value = 0.0
+    else:
+        communities_sets = list(nx.algorithms.community.louvain_communities(graph, seed=42))
+        pagerank_scores = nx.pagerank(graph)
+        modularity_value = nx.algorithms.community.quality.modularity(graph, communities_sets)
+
+    wcc_components = list(nx.connected_components(graph))
+    component_map = {
+        node: idx for idx, component in enumerate(wcc_components) for node in component
+    }
+
+    update_rows: list[dict[str, object]] = []
+    for idx, community_nodes in enumerate(communities_sets):
+        for node in community_nodes:
+            update_rows.append(
+                {
+                    "element_id": node,
+                    "communityId": idx,
+                    "pagerank": float(pagerank_scores.get(node, 0.0)),
+                    "wccId": component_map.get(node),
+                }
+            )
+
+    if update_rows:
+        def _apply_updates(session: Session):
+            session.run(
+                f"""
+                UNWIND $rows AS row
+                MATCH (n:Entity) WHERE elementId(n) = row.element_id
+                SET n.{COMMUNITY_PROPERTY} = row.communityId,
+                    n.{PAGERANK_PROPERTY} = row.pagerank,
+                    n.{WCC_PROPERTY} = row.wccId
+                """,
+                rows=update_rows,
+            )
+
+        _with_session(_apply_updates)
+
+    communities: list[dict[str, object]] = []
+    for idx, community_nodes in enumerate(communities_sets):
+        ranking = []
+        members = []
+        for node in community_nodes:
+            attrs = graph.nodes[node]
+            name = attrs.get("name") or f"entity_{node}"
+            members.append(name)
+            ranking.append(
+                {
+                    "name": name,
+                    "pagerank": float(pagerank_scores.get(node, 0.0)),
+                }
+            )
+
+        ranking.sort(key=lambda entry: (-entry["pagerank"], entry["name"]))
+        top_nodes = ranking[:COMMUNITY_SEED_LIMIT]
+        wcc_ids = sorted({component_map.get(node) for node in community_nodes if node in component_map})
+
+        communities.append(
+            {
+                "id": f"louvain_{idx}",
+                "size": len(community_nodes),
+                "members": members[:SUMMARY_TOP_N],
+                "top_nodes": top_nodes,
+                "wcc_ids": wcc_ids,
+            }
+        )
+
+    metrics = {
+        "wcc": {"componentCount": len(wcc_components)},
+        "louvain": {
+            "communityCount": len(communities_sets),
+            "modularity": modularity_value,
+        },
+        "pagerank": {
+            "nodeCount": graph.number_of_nodes(),
+            "edgeCount": graph.number_of_edges(),
+        },
+    }
+
+    return {"communities": communities, "metrics": metrics}
 
 # ---------------------------------------------
 # STEP 6: Community Summarization
 # ---------------------------------------------
-def summarize_community(nodes):
-    """Summarize a community of entities"""
-    if not nodes:
+def summarize_community(community):
+    """Summarize a community using its top-ranked nodes."""
+    members = community.get("members", [])
+    top_nodes = community.get("top_nodes", [])
+
+    if not members:
         return "Empty community"
-    
-    text = ", ".join(nodes[:50])
+
+    names = [node["name"] if isinstance(node, dict) else node for node in members]
+    text = ", ".join(names[:SUMMARY_TOP_N])
+
+    highlights = ", ".join(
+        f"{node['name']} (PR={node.get('pagerank', 0.0):.4f})"
+        for node in top_nodes
+    ) if top_nodes else ""
+
     prompt = f"""Summarize this community of related entities in 2-3 sentences:
 Entities: {text}
+
+Key Entities by PageRank: {highlights}
 
 Provide a concise summary describing what these entities represent and their relationships."""
     
@@ -374,26 +557,62 @@ Provide a concise summary describing what these entities represent and their rel
 # ---------------------------------------------
 # STEP 7: Embedding Communities
 # ---------------------------------------------
-def embed_communities(summaries):
+
+def embed_community(community):
+    """Generate and store embedding for a community."""
+    if not community or "summary" not in community:
+        return
+    
+    try:
+        # Generate embedding for the community summary
+        embedding = get_embedding(community["summary"])
+        community["embedding"] = embedding.tolist() if hasattr(embedding, 'tolist') else embedding
+        return True
+    except Exception as e:
+        print(f"Error embedding community: {e}")
+        return False
+def embed_communities(communities):
     """Embed community summaries into vector database"""
-    for idx, summary in enumerate(summaries):
-        if summary:
-            try:
-                emb = embedder.encode(summary).tolist()
-                vector_db.add(ids=[f"comm_{idx}"], documents=[summary], embeddings=[emb])
-            except Exception as e:
-                print(f"Embedding error for community {idx}: {e}")
+    for community in communities:
+        # This will handle both the embedding and storing in the community dict
+        if not embed_community(community):
+            continue
+            
+        doc_id = str(community.get("id", f"comm_{id(community)}"))
+        
+        try:
+            # Store in ChromaDB if available, otherwise use the existing vector_db
+            if 'chroma_client' in globals() and chroma_client is not None:
+                chroma_collection.upsert(
+                    ids=[doc_id],
+                    documents=[community.get("summary", "")],
+                    metadatas=[{"type": "community", "id": doc_id}],
+                    embeddings=[community["embedding"]]
+                )
+            else:
+                # Fallback to the original vector_db implementation
+                try:
+                    vector_db.delete(ids=[doc_id])
+                except Exception:
+                    pass
+                vector_db.add(
+                    ids=[doc_id], 
+                    documents=[community.get("summary", "")], 
+                    embeddings=[community["embedding"]]
+                )
+        except Exception as e:
+            print(f"Embedding error for community {doc_id}: {e}")
 
 # ---------------------------------------------
 # STEP 8: Save Index to Disk
 # ---------------------------------------------
-def save_index(communities, summaries):
+def save_index(communities, metrics):
     """Save the built index to disk"""
     os.makedirs(INDEX_DIR, exist_ok=True)
     
     index_data = {
         "communities": communities,
-        "summaries": summaries
+        "metrics": metrics
     }
     
     with open(INDEX_FILE, "w") as f:
@@ -412,7 +631,32 @@ def load_index():
         index_data = json.load(f)
     
     print(f"✅ Index loaded from {INDEX_FILE}")
-    return index_data["communities"], index_data["summaries"]
+    raw_communities = index_data.get("communities", [])
+    normalized = []
+
+    for idx, community in enumerate(raw_communities):
+        if isinstance(community, dict):
+            normalized.append(community)
+            continue
+
+        if isinstance(community, list):
+            normalized.append({
+                "id": f"legacy_{idx}",
+                "members": community,
+                "top_nodes": [],
+                "summary": ", ".join(community[:SUMMARY_TOP_N]) if community else "",
+            })
+            continue
+
+        # Fallback for unexpected formats
+        normalized.append({
+            "id": f"legacy_{idx}",
+            "members": [str(community)],
+            "top_nodes": [],
+            "summary": str(community),
+        })
+
+    return normalized, index_data.get("metrics", {})
 
 
 def index_exists() -> bool:
@@ -443,37 +687,82 @@ def retrieve_topk(query, top_k=5):
 # ---------------------------------------------
 # STEP 10: Graph Reasoning (Multi-hop)
 # ---------------------------------------------
-def graph_reasoning_multi_hop(retrieved_summaries, hops=2):
-    """Expand retrieved nodes using multi-hop graph traversal"""
-    nodes_set = set()
+def graph_reasoning_multi_hop(seed_communities, hops=2, neighbor_limit=25):
+    """Expand graph context using community-constrained multi-hop traversal."""
+    if not seed_communities:
+        return []
+
+    community_prop = COMMUNITY_PROPERTY
+    pagerank_prop = PAGERANK_PROPERTY
+
+    nodes_map: dict[str, dict] = {}
+
+    def _update_node(name: str, pagerank: float | None, community_id: str):
+        if not name:
+            return
+        key = (community_id, name)
+        current = nodes_map.get(key)
+        value = pagerank or 0.0
+        if current is None or value > current.get("pagerank", 0.0):
+            nodes_map[key] = {
+                "name": name,
+                "pagerank": value,
+                "communityId": community_id,
+            }
 
     def _traverse(session: Session):
-        for summary in retrieved_summaries:
-            result = session.run(
-                """
-                MATCH (n:Entity)
-                RETURN n.name AS name
-                LIMIT 10
-                """
-            )
+        for community in seed_communities:
+            if not community:
+                continue
+            community_id = str(community.get("id"))
 
-            for record in result:
-                node_name = record["name"]
-                hop_result = session.run(
+            seeds = [
+                node.get("name")
+                for node in community.get("top_nodes", [])
+                if isinstance(node, dict) and node.get("name")
+            ]
+
+            if not seeds:
+                seeds = [name for name in community.get("members", [])][:COMMUNITY_SEED_LIMIT]
+
+            for seed_name in seeds:
+                if not seed_name:
+                    continue
+
+                # add the seed itself with known PageRank if available
+                pr_lookup = next(
+                    (node.get("pagerank") for node in community.get("top_nodes", [])
+                     if isinstance(node, dict) and node.get("name") == seed_name),
+                    None,
+                )
+                _update_node(seed_name, pr_lookup, community_id)
+
+                result = session.run(
                     f"""
-                    MATCH path = (n:Entity {{name:$name}})-[*1..{hops}]-(m:Entity)
-                    RETURN DISTINCT m.name AS neighbor
-                    LIMIT 20
+                    MATCH (seed:Entity {{name:$seed}})
+                    MATCH (seed)-[:RELATION*1..{hops}]-(neighbor:Entity)
+                    WHERE neighbor.{community_prop} = seed.{community_prop}
+                    RETURN DISTINCT neighbor.name AS name,
+                           neighbor.{pagerank_prop} AS pagerank
+                    ORDER BY pagerank DESC, name ASC
+                    LIMIT $limit
                     """,
-                    name=node_name,
+                    seed=seed_name,
+                    limit=neighbor_limit,
                 )
 
-                nodes_set.add(node_name)
-                nodes_set.update([r["neighbor"] for r in hop_result])
+                for record in result:
+                    _update_node(
+                        record.get("name"),
+                        record.get("pagerank"),
+                        community_id,
+                    )
 
     _with_session(_traverse)
 
-    return list(nodes_set)
+    nodes = list(nodes_map.values())
+    nodes.sort(key=lambda item: (-item.get("pagerank", 0.0), item.get("name", "")))
+    return nodes
 
 # ---------------------------------------------
 # STEP 11: Context Fusion
@@ -482,8 +771,18 @@ def fuse_context(retrieved, graph_nodes):
     """Fuse retrieved summaries and graph nodes into context"""
     fused = ["Retrieved Community Summaries:"]
     fused += [f"- {r['summary']}" for r in retrieved]
-    fused.append("\nRelated Entities from Knowledge Graph:")
-    fused += [f"- {n}" for n in graph_nodes[:30]]
+    fused.append("\nCommunity-Neighborhood Entities:")
+
+    for node in graph_nodes[:30]:
+        name = node.get("name") if isinstance(node, dict) else str(node)
+        pr = node.get("pagerank") if isinstance(node, dict) else None
+        community_id = node.get("communityId") if isinstance(node, dict) else None
+        fused.append(
+            f"- {name}"
+            + (f" (PR={pr:.4f})" if pr is not None else "")
+            + (f" [community {community_id}]" if community_id is not None else "")
+        )
+
     return "\n".join(fused)
 
 # ---------------------------------------------
@@ -491,18 +790,14 @@ def fuse_context(retrieved, graph_nodes):
 # ---------------------------------------------
 def generate_answer(query, fused_context):
     """Generate final answer using LLM"""
-    prompt = f"""You are an expert at reasoning over a knowledge graph.
-Use ONLY the provided context to answer the question.
+    template = _load_prompt_template("graph_rag_prompt.md")
+    prompt = (
+        f"{template}\n\n"
+        f"Context:\n{fused_context}\n\n"
+        f"Question: {query}\n\n"
+        "Answer:"
+    )
 
-Context:
-{fused_context}
-
-Question: {query}
-
-Provide a clear, concise answer based only on the context above. If the context doesn't contain enough information, say so.
-
-Answer:"""
-    
     return llm_call(prompt)
 
 # ---------------------------------------------
@@ -570,14 +865,33 @@ def visualize_knowledge_graph(output_html="graph.html", limit=500):
 # ---------------------------------------------
 # PHASE 1: BUILD INDEX (RUN ONCE)
 # ---------------------------------------------
+def verify_neo4j_connection() -> dict:
+    """Verify Neo4j connection and return node/relationship counts."""
+    def _get_counts(session):
+        node_count = session.run("MATCH (n:Entity) RETURN count(n) as count").single()["count"]
+        rel_count = session.run("MATCH ()-[r:RELATION]->() RETURN count(r) as count").single()["count"]
+        return {"nodes": node_count, "relationships": rel_count}
+    
+    try:
+        counts = _with_session(_get_counts)
+        print(f"✅ Neo4j Connected: {counts['nodes']} nodes, {counts['relationships']} relationships")
+        return counts
+    except Exception as e:
+        print(f"❌ Neo4j Connection Error: {e}")
+        return {"nodes": 0, "relationships": 0, "error": str(e)}
+
 def build_index(text, clear_db=True):
-    """Build the GraphRAG index - run this ONCE"""
+    """Build the GraphRAG index with verification and batch processing"""
     print("="*60)
-    print("🔨 BUILDING GRAPHRAG INDEX (Run once or when data changes)")
+    print("🔨 BUILDING GRAPHRAG INDEX")
     print("="*60)
     
+    # Verify initial connection
+    print("\nVerifying Neo4j connection...")
+    initial_counts = verify_neo4j_connection()
+    
     if clear_db:
-        print("Clearing existing graph...")
+        print("\nClearing existing graph...")
         clear_graph()
     
     # STEP 1: Semantic Chunking
@@ -598,53 +912,106 @@ def build_index(text, clear_db=True):
     
     # STEP 5: Community Detection
     print("\nStep 5: Detecting communities...")
-    communities = detect_communities()
+    community_payload = detect_communities()
+    communities = community_payload.get("communities", [])
+    metrics = community_payload.get("metrics", {})
     print(f"Detected {len(communities)} communities")
     
-    # STEP 6: Community Summarization
-    print("\nStep 6: Summarizing communities...")
-    summaries = [summarize_community(c) for c in communities]
+    # STEP 6: Process communities in batches
+    print("\nStep 6: Processing communities in batches...")
+    batch_size = 5
+    delay_between_batches = 3  # seconds
     
-    # STEP 7: Embed Communities
-    print("\nStep 7: Embedding communities...")
-    embed_communities(summaries)
+    for i in range(0, len(communities), batch_size):
+        batch = communities[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        total_batches = (len(communities) + batch_size - 1) // batch_size
+        
+        print(f"\nProcessing batch {batch_num}/{total_batches} (communities {i+1}-{min(i+batch_size, len(communities))})")
+        
+        for community in batch:
+            # Attach supporting texts
+            attach_supporting_texts([community], chunks)
+            
+            # Summarize community
+            community["summary"] = summarize_community(community)
+            
+            # Embed community
+            embed_community(community)
+        
+        # Add delay between batches if not the last batch
+        if i + batch_size < len(communities):
+            print(f"Waiting {delay_between_batches} seconds before next batch...")
+            time.sleep(delay_between_batches)
     
-    # STEP 8: Save Index
-    print("\nStep 8: Saving index to disk...")
-    save_index(communities, summaries)
+    # STEP 7: Save Index
+    print("\nStep 7: Saving index to disk...")
+    save_index(communities, metrics)
+    
+    # Verify final state
+    print("\nFinal graph statistics:")
+    final_counts = verify_neo4j_connection()
+    
+    # Calculate added nodes/relationships
+    if "error" not in initial_counts and "error" not in final_counts:
+        added_nodes = final_counts["nodes"] - initial_counts.get("nodes", 0)
+        added_rels = final_counts["relationships"] - initial_counts.get("relationships", 0)
+        print(f"  • Added {added_nodes} nodes and {added_rels} relationships")
+    
+    # Print WCC and PageRank metrics if available
+    wcc = metrics.get("wcc", {})
+    if wcc:
+        print(f"  • WCC components: {wcc.get('componentCount', 'n/a')}")
+    pr = metrics.get("pagerank", {})
+    if pr:
+        print(f"  • PageRank iterations: {pr.get('ranIterations', 'n/a')}")
     
     print("\n" + "="*60)
     print("✅ INDEX BUILT SUCCESSFULLY!")
     print("="*60)
     
-    return communities, summaries
-
-# ---------------------------------------------
+    return communities, metrics
 # PHASE 2: QUERY (RUN MANY TIMES - FAST!)
 # ---------------------------------------------
-def query_graphrag(query_text, top_k=3, hops=2):
-    """Query the pre-built GraphRAG index - FAST!"""
+def query_graphrag(query_text, top_k=5, hops=3):
+    """Query the pre-built GraphRAG index with increased context"""
     print("="*60)
     print(f"🔍 QUERYING: {query_text}")
     print("="*60)
     
     # Load index if needed (only happens once)
     try:
-        communities, summaries = load_index()
+        communities, metrics = load_index()
     except FileNotFoundError as e:
         print(f"❌ Error: {e}")
-        return None
+        print("Please build the index first by running 'rebuild graph'")
+        return "Index not found. Please build the index first."
+
+    community_map = {}
+    for idx, community in enumerate(communities):
+        cid = community.get("id") if isinstance(community, dict) else None
+        if cid is None:
+            cid = f"legacy_{idx}"
+            if isinstance(community, dict):
+                community["id"] = cid
+            else:
+                community = {"id": cid, "members": community}
+        community_map[str(cid)] = community
+
+    # Encode query
+    query_embedding = get_embedding(query_text)
     
-    # STEP 9: Vector Retrieval
-    print("\nStep 9: Retrieving relevant communities...")
+    # Get relevant communities
     retrieved = retrieve_topk(query_text, top_k)
     print(f"Retrieved {len(retrieved)} communities")
     
-    # STEP 10: Graph Reasoning
-    print("\nStep 10: Multi-hop graph reasoning...")
-    graph_nodes = graph_reasoning_multi_hop([r["summary"] for r in retrieved], hops)
+    # Get relevant entities with increased neighbor limit
+    seed_ids = [str(item.get("id")) if hasattr(item, "get") else str(item) for item in retrieved]
+    seed_communities = [community_map.get(cid) for cid in seed_ids]
+    seed_communities = [c for c in seed_communities if c]
+    graph_nodes = graph_reasoning_multi_hop(seed_communities, hops)
     print(f"Collected {len(graph_nodes)} related entities")
-    
+
     # STEP 11: Context Fusion
     print("\nStep 11: Fusing context...")
     fused_context = fuse_context(retrieved, graph_nodes)

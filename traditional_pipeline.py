@@ -8,12 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from functools import lru_cache
 from typing import Any
 import json
 import logging
 
 import faiss
-import google.generativeai as genai
+from groq import Groq
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
@@ -39,14 +40,15 @@ class TraditionalRAGPipeline:
         self.config = config
         self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
         
-        # Initialize Gemini
+        # Initialize Groq client
         try:
-            genai.configure(api_key=config.gemini_api_key)
-            self.gemini_model = genai.GenerativeModel(
-                getattr(config, 'gemini_model', 'gemini-2.0-flash')
-            )
+            api_key = getattr(config, 'groq_api_key', None)
+            if not api_key:
+                raise ValueError("GROQ_API_KEY is missing from configuration")
+            self.groq_model = getattr(config, 'groq_model', 'mixtral-8x7b-32768')
+            self.groq_client = Groq(api_key=api_key)
         except Exception as e:
-            logger.error(f"Failed to initialize Gemini: {e}")
+            logger.error(f"Failed to initialize Groq client: {e}")
             raise
         
         # Setup paths
@@ -156,8 +158,15 @@ class TraditionalRAGPipeline:
         prompt = self._answer_prompt(question, context)
         
         try:
-            response = self.gemini_model.generate_content(prompt)
-            answer = response.text.strip() if response.text else "No answer generated."
+            response = self.groq_client.chat.completions.create(
+                model=self.groq_model,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            answer = (
+                response.choices[0].message.content.strip()
+                if response.choices and response.choices[0].message.content
+                else "No answer generated."
+            )
         except Exception as e:
             logger.error(f"Answer generation failed: {e}")
             answer = f"Error generating answer: {str(e)}"
@@ -289,16 +298,18 @@ class TraditionalRAGPipeline:
 
     def _answer_prompt(self, question: str, context: str) -> str:
         """Generate prompt for answer generation."""
+        template = _load_prompt_template("trad_rag_prompt.md")
         return (
-            "You are a helpful assistant answering questions using provided document chunks.\n"
-            "Base your answer solely on the supplied context. If the context is insufficient, say so.\n"
-            "Be concise and accurate.\n"
-            "\n"
-            "Question:\n"
-            f"{question}\n"
-            "\n"
-            "Context:\n"
-            f"{context}\n"
-            "\n"
+            f"{template}\n\n"
+            f"Question:\n{question}\n\n"
+            f"Context:\n{context}\n\n"
             "Answer:"
         )
+
+
+@lru_cache(maxsize=4)
+def _load_prompt_template(filename: str) -> str:
+    template_path = Path(__file__).resolve().parent / filename
+    if not template_path.exists():
+        raise FileNotFoundError(f"Prompt template not found: {template_path}")
+    return template_path.read_text(encoding="utf-8").strip()
