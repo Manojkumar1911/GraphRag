@@ -6,10 +6,10 @@ This CLI orchestrates both graph-based and traditional RAG pipelines:
 
 Graph RAG:
     • Semantic chunking over TXT knowledge bases
-    • Entity extraction using Gemini
+    • Entity extraction using spaCy
     • Neo4j for persistent knowledge graphs
     • Community detection
-    • Gemini 2.0 Flash summarization and answer synthesis
+    • Groq LLM summarization and answer synthesis
     • ChromaDB for vector search on community summaries
 
 Traditional RAG:
@@ -18,7 +18,7 @@ Traditional RAG:
     • Direct context retrieval
 
 Usage:
-    python interactive_rag_demo.py
+    python interactive_rag_pipeline.py
 """
 
 from __future__ import annotations
@@ -37,18 +37,21 @@ except ImportError:
     VISUALIZATION_AVAILABLE = False
     print("⚠️  matplotlib/networkx not available. Visualization disabled.")
 
-from config import GraphRAGConfig
-from graph_pipeline import (
-    graph_rag_pipeline,
-    query_graphrag,
+# Import from new organized graphrag_pipeline package
+from graphrag_pipeline import (
     build_index,
-    load_index,
+    query_graphrag,
     index_exists,
+    _close_neo4j_driver,
+)
+from graphrag_pipeline.database import (
     vector_db,
     _with_session,
-    _close_neo4j_driver,
-    NEO4J_DATABASE,
 )
+from graphrag_pipeline.config import NEO4J_DATABASE
+
+# Import other dependencies (keep these as-is)
+from config import GraphRAGConfig
 from traditional_pipeline import TraditionalRAGPipeline
 
 
@@ -57,10 +60,10 @@ class GraphRAGCLI:
 
     def __init__(self) -> None:
         self.config = GraphRAGConfig()
+        self.config.refresh_kb_paths()
         
         # Initialize pipelines
         print("Initializing Graph RAG pipeline...")
-        self.graph_pipeline = graph_rag_pipeline
         self.graph_config = self.config
         
         print("Initializing Traditional RAG pipeline...")
@@ -93,19 +96,18 @@ class GraphRAGCLI:
         print("\n🛠️  Building Graph RAG pipeline...\n")
         
         try:
-            # Run the graph pipeline
-            from graph_pipeline import graph_rag_pipeline
-            
-            # Read knowledge base
-            kb_path = Path(getattr(self.config, 'kb_path', './kb.txt'))
-            if not kb_path.exists():
-                print(f"❌ Knowledge base not found: {kb_path}")
+            kb_files = self.config.refresh_kb_paths()
+            if not kb_files:
+                print("❌ No knowledge base files available. Place TXT files or update KB_PATH/KB_GLOB.")
                 return
-            
-            text = kb_path.read_text(encoding='utf-8')
-            
-            # Dummy query for building (won't be used)
-            graph_rag_pipeline(text, "dummy", clear_db=full_reset)
+
+            print(
+                "📚 Using knowledge base files: "
+                + ", ".join(path.name for path in kb_files)
+            )
+
+            text = self.graph_config.get_all_kb_text()
+            build_index(text, clear_db=full_reset)
             
             print("✅ Graph RAG pipeline built successfully.")
             self._graph_ready = True
@@ -132,16 +134,16 @@ class GraphRAGCLI:
     def query_graph(self, question: str) -> str:
         """Query Graph RAG system."""
         if not self._graph_ready:
-            return "❌ Graph RAG pipeline not built. Run 'build' first."
+            return "❌ Graph RAG pipeline not built. Run 'build graph' first."
         
         try:
-            kb_path = Path(getattr(self.config, 'kb_path', './kb.txt'))
-            if not kb_path.exists():
-                return f"❌ Knowledge base not found: {kb_path}"
+            kb_files = self.config.refresh_kb_paths()
+            if not kb_files:
+                return "❌ No knowledge base files configured."
 
             if not index_exists():
                 print("\nℹ️  No GraphRAG index found. Building once before querying...\n")
-                text = kb_path.read_text(encoding='utf-8')
+                text = self.config.get_all_kb_text()
                 build_index(text, clear_db=True)
                 self._graph_ready = True
 
@@ -155,8 +157,6 @@ class GraphRAGCLI:
             print(f"❌ Graph RAG query failed: {exc}")
             logging.exception("Graph RAG query failed", exc_info=exc)
             return f"❌ Error: {str(exc)}"
-        
-        print("\n" + "=" * 80 + "\n")
 
     def query_trad(self, question: str) -> None:
         """Query Traditional RAG system."""
@@ -302,11 +302,12 @@ def print_banner() -> None:
 ║        🕸️  GRAPH RAG INTERACTIVE DEMO                                      ║
 ║                                                                            ║
 ║   Compare Graph RAG vs Traditional RAG side-by-side!                       ║
-║   Powered by Neo4j, ChromaDB, FAISS, and Gemini 2.0 Flash.                ║
+║   Powered by Neo4j, ChromaDB, FAISS, and Groq LLM.                        ║
 ║                                                                            ║
 ╚════════════════════════════════════════════════════════════════════════════╝
     """
     print(banner)
+
 
 def print_menu() -> None:
     """Print command menu."""
@@ -330,6 +331,7 @@ def print_menu() -> None:
     """
     print(menu)
 
+
 def show_examples() -> None:
     """Show example queries."""
     examples = """
@@ -344,6 +346,7 @@ def show_examples() -> None:
 💡 TIP: Try the same question on both systems to compare!
     """
     print(examples)
+
 
 def main():
     """Main interactive loop."""
@@ -430,7 +433,11 @@ def main():
             if lowered.startswith("graph:"):
                 question = user_input.split(":", 1)[1].strip()
                 if question:
-                    cli.query_graph(question)
+                    answer = cli.query_graph(question)
+                    if answer:
+                        print("\n💬 GRAPH RAG ANSWER\n" + "-" * 80)
+                        print(textwrap.fill(answer, width=80))
+                        print("\n" + "=" * 80 + "\n")
                 else:
                     print("⚠️  Provide a question after 'graph:'")
                 continue
@@ -458,6 +465,7 @@ def main():
                 if graph_answer:
                     print("\n💬 GRAPH RAG ANSWER\n" + "-" * 80)
                     print(textwrap.fill(graph_answer, width=80))
+                    print("\n" + "=" * 80 + "\n")
                 else:
                     print("⚠️  No Graph RAG answer returned.")
             else:
