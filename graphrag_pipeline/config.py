@@ -8,7 +8,6 @@ model objects expected by the pipeline modules.
 from __future__ import annotations
 
 import os
-import spacy
 from sentence_transformers import SentenceTransformer
 
 from config import GraphRAGConfig
@@ -32,16 +31,6 @@ GROQ_BASE_BACKOFF_SECONDS = float(os.getenv("GROQ_BASE_BACKOFF_SECONDS", "2"))
 CHROMA_PERSIST_DIR = str(CONFIG.chroma_dir)
 INDEX_DIR = os.getenv("INDEX_DIR", "./graphrag_index")
 INDEX_FILE = os.path.join(INDEX_DIR, "index.json")
-
-# spaCy / NLP configuration
-SPACY_MODEL = os.getenv("SPACY_MODEL", "en_core_web_sm")
-try:
-    nlp = spacy.load(SPACY_MODEL)
-except OSError as exc:  # pragma: no cover - runtime dependency
-    raise RuntimeError(
-        f"spaCy model '{SPACY_MODEL}' is not available. "
-        f"Install it via 'python -m spacy download {SPACY_MODEL}'."
-    ) from exc
 
 # SentenceTransformer embedder
 embedder = SentenceTransformer("all-MiniLM-L6-v2")

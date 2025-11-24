@@ -70,13 +70,9 @@ class TraditionalRAGPipeline:
     # ------------------------------------------------------------------
     def build(self, reset_index: bool = True) -> list[TraditionalChunk]:
         """Build traditional RAG index from knowledge base."""
-        kb_path = Path(getattr(self.config, 'kb_path', './kb.txt'))
-        logger.info(f"Building traditional RAG index from {kb_path}")
+        text, source_desc = self._load_kb_text()
+        logger.info(f"Building traditional RAG index from {source_desc}")
         
-        if not kb_path.exists():
-            raise FileNotFoundError(f"Knowledge base not found: {kb_path}")
-        
-        text = kb_path.read_text(encoding="utf-8")
         if not text.strip():
             raise ValueError("Knowledge base is empty")
         
@@ -113,6 +109,29 @@ class TraditionalRAGPipeline:
         logger.info(f"Traditional RAG index now has {len(self.metadata)} chunks")
         
         return chunks
+
+    def _load_kb_text(self) -> tuple[str, str]:
+        """Resolve KB text using GraphRAGConfig when available."""
+        refresh_fn = getattr(self.config, "refresh_kb_paths", None)
+        get_all_fn = getattr(self.config, "get_all_kb_text", None)
+
+        if callable(refresh_fn) and callable(get_all_fn):
+            kb_paths = refresh_fn()
+            if not kb_paths:
+                raise FileNotFoundError(
+                    "No knowledge base files discovered. Update KB_PATH/KB_GLOB or place TXT/PDF files under the KB folder."
+                )
+
+            preview = ", ".join(path.name for path in kb_paths[:5])
+            if len(kb_paths) > 5:
+                preview += ", ..."
+
+            return get_all_fn(), f"{len(kb_paths)} files ({preview})"
+
+        kb_path = Path(getattr(self.config, 'kb_path', './kb.txt'))
+        if not kb_path.exists():
+            raise FileNotFoundError(f"Knowledge base not found: {kb_path}")
+        return kb_path.read_text(encoding="utf-8"), str(kb_path)
 
     # ------------------------------------------------------------------
     # Query flow

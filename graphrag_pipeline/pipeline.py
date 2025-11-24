@@ -153,7 +153,11 @@ def build_index(text, clear_db=True):
     
     # STEP 2: Entity & Relationship Extraction
     print("\nStep 2: Extracting entities and relationships...")
-    chunk_items = [extract_entities_relations(c) for c in chunks]
+    chunk_items = []
+    for chunk in chunks:
+        extracted = extract_entities_relations(chunk)
+        chunk_items.append({"text": chunk, **extracted})
+    
     total_entities = sum(len(item["entities"]) for item in chunk_items)
     total_relations = sum(len(item["relationships"]) for item in chunk_items)
     print(f"Extracted {total_entities} entities and {total_relations} relationships")
@@ -169,8 +173,8 @@ def build_index(text, clear_db=True):
     metrics = community_payload.get("metrics", {})
     print(f"Detected {len(communities)} communities")
     
-    # STEP 6: Process communities in batches
-    print("\nStep 6: Processing communities in batches...")
+    # STEP 6: Process communities in batches (summarize only)
+    print("\nStep 6: Summarizing communities in batches...")
     batch_size = 5
     delay_between_batches = 3  # seconds
     
@@ -182,11 +186,8 @@ def build_index(text, clear_db=True):
         print(f"\nProcessing batch {batch_num}/{total_batches} (communities {i+1}-{min(i+batch_size, len(communities))})")
         
         for community in batch:
-            # Attach supporting texts
-            attach_supporting_texts([community], chunks)
-            
             # Summarize community
-            community["summary"] = summarize_community(community)
+            community["summary"] = summarize_community(community["id"])
             
             # Embed community
             embed_community(community)
@@ -196,12 +197,16 @@ def build_index(text, clear_db=True):
             print(f"Waiting {delay_between_batches} seconds before next batch...")
             time.sleep(delay_between_batches)
     
-    # STEP 7: Embed all communities into vector DB
-    print("\nStep 7: Storing embeddings in vector database...")
+    # STEP 7: Attach supporting texts ONCE (outside loop)
+    print("\nStep 7: Attaching supporting texts to entities...")
+    attach_supporting_texts(chunk_items)
+    
+    # STEP 8: Embed all communities into vector DB
+    print("\nStep 8: Storing embeddings in vector database...")
     embed_communities(communities)
     
-    # STEP 8: Save Index
-    print("\nStep 8: Saving index to disk...")
+    # STEP 9: Save Index
+    print("\nStep 9: Saving index to disk...")
     save_index(communities, metrics)
     
     # Verify final state

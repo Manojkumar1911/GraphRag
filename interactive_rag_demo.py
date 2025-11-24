@@ -6,7 +6,7 @@ This CLI orchestrates both graph-based and traditional RAG pipelines:
 
 Graph RAG:
     • Semantic chunking over TXT knowledge bases
-    • Entity extraction using spaCy
+    • Entity extraction using transformer-based NER
     • Neo4j for persistent knowledge graphs
     • Community detection
     • Groq LLM summarization and answer synthesis
@@ -98,7 +98,7 @@ class GraphRAGCLI:
         try:
             kb_files = self.config.refresh_kb_paths()
             if not kb_files:
-                print("❌ No knowledge base files available. Place TXT files or update KB_PATH/KB_GLOB.")
+                print("❌ No knowledge base files available. Place TXT/PDF files (subfolders are scanned) or update KB_PATH/KB_GLOB.")
                 return
 
             print(

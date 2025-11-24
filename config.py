@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
+import re
 from typing import List
 
 _ENV_INITIALIZED = False
@@ -82,7 +83,7 @@ class GraphRAGConfig:
     """Configuration container for the Graph RAG pipeline."""
 
     kb_path: Path = Path(os.getenv("KB_PATH", "kb.txt")).resolve()
-    kb_glob: str = os.getenv("KB_GLOB", "*.txt")
+    kb_glob: str = os.getenv("KB_GLOB", "*.txt;*.pdf")
     kb_paths: List[Path] = field(default_factory=list)
     chroma_dir: Path = Path(os.getenv("CHROMA_PERSIST_DIR", "chroma_store")).resolve()
     faiss_dir: Path = Path(os.getenv("FAISS_PERSIST_DIR", "faiss_store")).resolve()
@@ -113,7 +114,7 @@ class GraphRAGConfig:
 
         if not self.kb_paths:
             missing.append(
-                "No knowledge base files found. Set KB_PATH, KB_GLOB, or place TXT files in the project root."
+                "No knowledge base files found. Set KB_PATH, KB_GLOB (supports multiple patterns like '*.txt;*.pdf'), or place TXT/PDF files in the project root."
             )
         if not self.neo4j_uri:
             missing.append("NEO4J_URI is required")
@@ -133,16 +134,34 @@ class GraphRAGConfig:
     # ------------------------------------------------------------------
     def refresh_kb_paths(self) -> List[Path]:
         """Discover KB files based on KB_PATH / KB_GLOB settings."""
-        kb_dir = self.kb_path.parent
+        patterns = self._kb_patterns()
         discovered: list[Path] = []
+        seen: set[Path] = set()
 
-        if kb_dir.exists():
-            discovered.extend(sorted(kb_dir.glob(self.kb_glob)))
+        def _add_path(candidate: Path) -> None:
+            resolved = candidate.resolve()
+            if resolved.is_file() and resolved not in seen:
+                seen.add(resolved)
+                discovered.append(resolved)
 
-        if self.kb_path.exists() and self.kb_path not in discovered:
-            discovered.append(self.kb_path)
+        search_dirs: list[Path] = []
+        if self.kb_path.is_dir():
+            search_dirs.append(self.kb_path)
+        else:
+            kb_dir = self.kb_path.parent
+            if kb_dir.exists():
+                search_dirs.append(kb_dir)
+            if self.kb_path.exists():
+                _add_path(self.kb_path)
 
-        self.kb_paths = [path.resolve() for path in discovered if path.is_file()]
+        for base_dir in search_dirs:
+            if not base_dir.exists():
+                continue
+            for pattern in patterns:
+                for match in base_dir.rglob(pattern):
+                    _add_path(match)
+
+        self.kb_paths = discovered
         return self.kb_paths
 
     def get_all_kb_text(self) -> str:
@@ -151,7 +170,7 @@ class GraphRAGConfig:
 
         if not paths:
             raise FileNotFoundError(
-                "No knowledge base files available. Provide KB_PATH/KB_GLOB or place TXT files in the repository."
+                "No knowledge base files available. Provide KB_PATH/KB_GLOB or place TXT/PDF files in the repository."
             )
 
         texts: list[str] = []
@@ -159,9 +178,12 @@ class GraphRAGConfig:
 
         for path in paths:
             try:
-                content = path.read_text(encoding="utf-8").strip()
+                content = self._read_kb_file(path).strip()
             except FileNotFoundError:
                 missing.append(str(path))
+                continue
+            except RuntimeError as exc:
+                print(f"⚠️  Skipped {path.name}: {exc}")
                 continue
 
             if content:
@@ -174,3 +196,38 @@ class GraphRAGConfig:
             raise ValueError("Knowledge base files are empty. Add content before rebuilding the graph.")
 
         return "\n\n".join(texts)
+
+    # ------------------------------------------------------------------
+    def _kb_patterns(self) -> list[str]:
+        raw = (self.kb_glob or "").strip()
+        patterns = [token.strip() for token in re.split(r"[;,]", raw) if token.strip()]
+        return patterns or ["*.txt"]
+
+    def _read_kb_file(self, path: Path) -> str:
+        suffix = path.suffix.lower()
+        if suffix == ".pdf":
+            return self._read_pdf_file(path)
+        return path.read_text(encoding="utf-8")
+
+    def _read_pdf_file(self, path: Path) -> str:
+        try:
+            from pypdf import PdfReader
+        except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("PDF support requires the optional 'pypdf' package. Install it via 'pip install pypdf'.") from exc
+
+        try:
+            reader = PdfReader(str(path))
+        except Exception as exc:  # pragma: no cover - runtime parsing issues
+            raise RuntimeError(f"Failed to open PDF: {exc}") from exc
+
+        text_parts: list[str] = []
+        for page_idx, page in enumerate(reader.pages):
+            try:
+                extracted = page.extract_text() or ""
+            except Exception as exc:  # pragma: no cover - upstream errors
+                raise RuntimeError(f"Failed to extract text from page {page_idx + 1}: {exc}") from exc
+            cleaned = extracted.strip()
+            if cleaned:
+                text_parts.append(cleaned)
+
+        return "\n".join(text_parts)
